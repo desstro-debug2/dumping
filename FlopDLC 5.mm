@@ -261,6 +261,33 @@ static void RedirectStderrToLog(NSString* docs) {
     close(fd);
 }
 
+// Objective-C exceptions (nil deref, bad cast, bad array index) never become
+// Mach signals, so a signal handler alone leaves flop_crash.txt empty — which is
+// exactly the "crash but no crash log" symptom. Catch them here and dump the same
+// backtrace before re-raising so the crash is reproducible from the log.
+static void objcCrashHandler(NSException* exc) {
+    @try {
+        if (gCrashFd >= 0) {
+            char buf[256];
+            int n = snprintf(buf, sizeof(buf),
+                "\n=== CRASH objc=%s reason=%s ===\n",
+                [exc.name UTF8String], [exc.reason UTF8String]);
+            if (n > 0) {
+                write(gCrashFd, buf, n);
+            }
+            void* frames[64];
+            int fc = backtrace(frames, 64);
+            backtrace_symbols_fd(frames, fc, gCrashFd);
+        }
+        if (gLogDocPath) {
+            NSString* line = [NSString stringWithFormat:@"[FlopDLC] OBJC CRASH %@: %@\n", exc.name, exc.reason];
+            NSData* data = [line dataUsingEncoding:NSUTF8StringEncoding];
+            FILE* f = fopen([gLogDocPath UTF8String], "a");
+            if (f) { fwrite(data.bytes, 1, data.length, f); fclose(f); }
+        }
+    } @catch (...) {}
+}
+
 static void InstallCrashHandler(void) {
     @try {
         NSArray* paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
@@ -301,32 +328,6 @@ static void InstallCrashHandler(void) {
         sigaction(SIGTRAP, &sa, NULL);
         sigaction(SIGSYS, &sa, NULL);
         
-        // Objective-C exceptions (nil deref, bad cast, bad array index) never become
-        // Mach signals, so a signal handler alone leaves flop_crash.txt empty — which is
-        // exactly the "crash but no crash log" symptom. Catch them here and dump the same
-        // backtrace before re-raising so the crash is reproducible from the log.
-        static void objcCrashHandler(NSException* exc) {
-            @try {
-                if (gCrashFd >= 0) {
-                    char buf[256];
-                    int n = snprintf(buf, sizeof(buf),
-                        "\n=== CRASH objc=%s reason=%s ===\n",
-                        [exc.name UTF8String], [exc.reason UTF8String]);
-                    if (n > 0) {
-                        write(gCrashFd, buf, n);
-                    }
-                    void* frames[64];
-                    int fc = backtrace(frames, 64);
-                    backtrace_symbols_fd(frames, fc, gCrashFd);
-                }
-                if (gLogDocPath) {
-                    NSString* line = [NSString stringWithFormat:@"[FlopDLC] OBJC CRASH %@: %@\n", exc.name, exc.reason];
-                    NSData* data = [line dataUsingEncoding:NSUTF8StringEncoding];
-                    FILE* f = fopen([gLogDocPath UTF8String], "a");
-                    if (f) { fwrite(data.bytes, 1, data.length, f); fclose(f); }
-                }
-            } @catch (...) {}
-        }
         NSSetUncaughtExceptionHandler(objcCrashHandler);
     } @catch (NSException* e) {
     }
