@@ -2503,7 +2503,8 @@ static void ConfigResetFeatures(void) {
     gStatsPanelEnabled = false;
     gDamageLogEnabled = false;
     gAimDrawTarget = false;
-    gAimDrawFov = false;
+    // gAimDrawFov keeps its saved value: it is a cosmetic overlay, not a cheat toggle,
+    // and resetting it here would hide the aim FOV circle after every launch.
     gVelocityGraphEnabled = false;
     gSessionInfoEnabled = false;
     gDamageLogPanelEnabled = false;
@@ -6020,8 +6021,11 @@ static void UpdateStreamMode(void) {
             if (gStreamMode) {
                 RestoreAllChams();
                 gWatermark.hidden = YES;
-                gHotkeyView.hidden = YES;
-                gMenuView.hidden = YES;
+                gHotkeyView.hidden = NO;
+                gMenuView.hidden = NO;
+                if (gSnowOverlay) {
+                    gSnowOverlay.hidden = YES;
+                }
                 
                 if (!gSecureField) {
                     gSecureField = [[SecureTextField alloc] initWithFrame:gMainWin.bounds];
@@ -14191,7 +14195,9 @@ static void HudTick(void) {
         return;
     }
     
-    // Stream mode: keep only the crosshair/scope so the HUD looks like a normal game.
+    // Stream mode: hide every overlay that would read as a cheat on a recording.
+    // The menu and hotkey bar stay live so the operator can still work; only the
+    // in-game HUD (crosshair/scope) is kept so the stream looks like a normal match.
     if (gStreamMode) {
         [self drawScopeOverlay:ctx rect:rect];
         [self drawCrosshair:ctx rect:rect];
