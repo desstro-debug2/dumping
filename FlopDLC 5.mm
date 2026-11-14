@@ -2511,7 +2511,9 @@ static void ConfigResetFeatures(void) {
     gTargetListEnabled = false;
     gCrosshairDebugEnabled = false;
     gAmmoBarEnabled = false;
-    gFovCircleEnabled = false;
+    // gFovCircleEnabled and gAimDrawFov keep their saved values: they are cosmetic
+    // overlays, not cheat toggles, and resetting them here would hide the aim FOV
+    // circle after every launch.
     gFovCircleFilled = false;
 
     gTriggerbotEnabled = false;
