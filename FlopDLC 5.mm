@@ -305,7 +305,7 @@ static void InstallCrashHandler(void) {
         // Mach signals, so a signal handler alone leaves flop_crash.txt empty — which is
         // exactly the "crash but no crash log" symptom. Catch them here and dump the same
         // backtrace before re-raising so the crash is reproducible from the log.
-        NSSetUncaughtExceptionHandler(^(NSException* exc) {
+        static void objcCrashHandler(NSException* exc) {
             @try {
                 if (gCrashFd >= 0) {
                     char buf[256];
@@ -326,7 +326,8 @@ static void InstallCrashHandler(void) {
                     if (f) { fwrite(data.bytes, 1, data.length, f); fclose(f); }
                 }
             } @catch (...) {}
-        });
+        }
+        NSSetUncaughtExceptionHandler(objcCrashHandler);
     } @catch (NSException* e) {
     }
 }
@@ -402,6 +403,11 @@ static AVAudioPlayer* MakeTonePlayer(float freq, float dur, float amp) {
 }
 
 static std::atomic<bool> gSoundReady{false};
+
+// Forward declarations: these are defined lower in the file but used lazily below.
+static void RebuildSoundPlayers(void);
+static void InstallAllHooks(void);
+static void ApplyFpsLimit(void);
 
 // Lazy: create the tone players only when a hit/kill sound is actually requested,
 // never on a cold launch.
