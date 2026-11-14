@@ -10766,8 +10766,14 @@ static void startOverlay(void) {
     }
 }
 
+static std::atomic<bool> gBootstrapStarted{false};
 static void bootstrap(void) {
     @autoreleasepool {
+        // Second entry: a relaunch can re-fire the constructor on a stale il2cpp
+        // domain. Bail out before touching any il2cpp symbols or globals.
+        if (gBootstrapStarted.exchange(true)) {
+            return;
+        }
         InstallCrashHandler();
         gStatSessionStart = NowMs();
         
@@ -11149,13 +11155,20 @@ static void bootstrap(void) {
     }
 }
 
+static dispatch_once_t gCtorOnce;
 __attribute__((constructor, used))
 static void ctor(void) {
     // A loader constructor can run before later C++ global constructors. Wait for the
     // main run loop before touching vectors, strings, mutexes or saved preferences.
-    dispatch_async(dispatch_get_main_queue(), ^{
-        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-            bootstrap();
+    // dispatch_once: on a forced relaunch (kill the game, close the tabs, launch again)
+    // dyld can re-run this constructor while the previous process is still tearing down.
+    // Without the guard bootstrap() executes a second time on a torn-down il2cpp domain
+    // and the runtime aborts with no catchable frame.
+    dispatch_once(&gCtorOnce, ^{
+        dispatch_async(dispatch_get_main_queue(), ^{
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                bootstrap();
+            });
         });
     });
 }
