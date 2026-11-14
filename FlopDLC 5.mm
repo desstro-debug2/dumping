@@ -1335,8 +1335,6 @@ static void BallisticsCameraPost(void* camera);
 static void BallisticsFirePre(void);
 static void BallisticsFirePost(void);
 static void InstallBallisticsHooks(void);
-// Installed only once an aim mode that needs a forged shot is actually enabled.
-static void EnsureSilentAimPatch(void);
 static void SetupHudView(void);
 static void HudTick(void);
 static void HudBeginFrame(void);
@@ -2739,197 +2737,11 @@ static void* UFSym(const char* name) {
     return p;
 }
 
-// IL2CPP compiles direct calls to a plain `b`/`bl`, so patching the MethodInfo only
-// catches runtime_invoke/virtual dispatch. These helpers patch the native branch itself.
-static uintptr_t UnityFrameworkBase(void) {
-    // Do NOT iterate _dyld_image_count()/_dyld_get_image_name(): the image list can change
-    // while another thread loads a framework during startup, and libdyld aborts
-    // (SIGABRT, "image index out of range") when an index goes stale. dladdr() on a
-    // symbol we already resolved is stable and gives us the containing image base.
-    static uintptr_t cachedBase = 0;
-    if (cachedBase) {
-        return cachedBase;
-    }
-
-    void* sym = (void*)p_domain_get;
-    if (!sym) {
-        sym = UFSym("il2cpp_domain_get");
-    }
-    if (!sym) {
-        sym = UFSym("il2cpp_init");
-    }
-    if (!sym) {
-        return 0;
-    }
-
-    // dladdr is resolved through dlsym instead of being called directly. A dylib built
-    // with -undefined dynamic_lookup turns a missing import into a lazy bind, and dyld
-    // halts the process with "missing symbol called" on the first call. Resolving first
-    // lets a missing symbol disable the native patch instead of killing startup.
-    typedef int (*fn_dladdr)(const void*, Dl_info*);
-    static fn_dladdr p_dladdr = nullptr;
-    static bool resolved = false;
-    if (!resolved) {
-        resolved = true;
-        p_dladdr = (fn_dladdr)UFSym("dladdr");
-    }
-    if (!p_dladdr) {
-        return 0;
-    }
-
-    Dl_info info;
-    memset(&info, 0, sizeof(info));
-    if (p_dladdr(sym, &info) != 0 && info.dli_fbase) {
-        cachedBase = (uintptr_t)info.dli_fbase;
-    }
-    return cachedBase;
-}
-
-// Safe 4-byte read: returns false instead of faulting when `addr` is not mapped.
-// The fke RVAs are hardcoded, so after a game update they may point outside the
-// UnityFramework image; a raw dereference there would SIGSEGV at startup.
-static bool SafeReadU32(uintptr_t addr, uint32_t* out) {
-    if (!addr || !out) {
-        return false;
-    }
-    vm_size_t got = 0;
-    kern_return_t kr = vm_read_overwrite(mach_task_self(),
-                                              (vm_address_t)addr,
-                                              sizeof(uint32_t),
-                                              (vm_address_t)out,
-                                              &got);
-    return kr == KERN_SUCCESS && got == sizeof(uint32_t);
-}
-
-// Returns true when `site` holds a plain `b` whose resolved target equals `expected`.
-// Used to make sure a hardcoded RVA still points at the instruction we think it does
-// before we overwrite it. Only `b` is accepted because PatchBranch() rewrites the
-// instruction in place as a `b`; a `bl` would need its link register preserved.
-static bool BranchTargets(uintptr_t site, uintptr_t expected) {
-    if (!site) {
-        return false;
-    }
-    uint32_t insn = 0;
-    if (!SafeReadU32(site, &insn)) {
-        return false;
-    }
-    if ((insn & 0xFC000000) != 0x14000000) {
-        return false;
-    }
-    int64_t off = (int64_t)(insn & 0x03FFFFFF) << 2;
-    if (off & (1LL << 27)) {
-        off -= (1LL << 28);
-    }
-    return (site + (uintptr_t)off) == expected;
-}
-
-// __builtin___clear_cache lowers to a call to __clear_cache, which lives in compiler-rt
-// and is not exported by libSystem or libdyld. With -undefined dynamic_lookup (or
-// -nostdlib) that call is a lazy bind, and dyld aborts with "missing symbol called" the
-// first time it runs — which is exactly this patch path, right after the fke hook is
-// installed. sys_icache_invalidate is the libSystem export; resolve it through dlsym so
-// it can never be a lazy bind either.
-typedef void (*fn_sys_icache_invalidate)(void*, size_t);
-static fn_sys_icache_invalidate p_sys_icache_invalidate = nullptr;
-static bool g_icacheResolved = false;
-
-static bool EnsureICacheFlush(void) {
-    if (!g_icacheResolved) {
-        g_icacheResolved = true;
-        p_sys_icache_invalidate = (fn_sys_icache_invalidate)UFSym("sys_icache_invalidate");
-    }
-    return p_sys_icache_invalidate != nullptr;
-}
-
-static void FlushICache(void* start, size_t len) {
-    if (p_sys_icache_invalidate) {
-        p_sys_icache_invalidate(start, len);
-    }
-}
-
-static bool PatchBranch(uintptr_t site, uintptr_t target) {
-    if (!EnsureICacheFlush()) {
-        return false;
-    }
-    uint32_t* p = (uint32_t*)site;
-    uint32_t w = *p;
-    if ((w & 0xFC000000) != 0x14000000) {
-        return false;
-    }
-    int64_t delta = (int64_t)target - (int64_t)site;
-    if (delta % 4 != 0 || delta < -(1LL << 27) || delta >= (1LL << 27)) {
-        return false;
-    }
-    uint32_t nw = 0x14000000 | ((uint32_t)(delta >> 2) & 0x03FFFFFF);
-    long ps = sysconf(_SC_PAGESIZE);
-    vm_address_t start = (vm_address_t)p & ~((vm_address_t)ps - 1);
-    vm_address_t end = ((vm_address_t)p + 4 + ps - 1) & ~((vm_address_t)ps - 1);
-    if (vm_protect(mach_task_self(), start, end - start, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) != KERN_SUCCESS) {
-        return false;
-    }
-    *p = nw;
-    FlushICache(p, 4);
-    return true;
-}
-
-// The dylib can sit more than ±128 MB from UnityFramework, which is outside the range of a
-// single `b`. Allocate a small executable page near the site and jump through it.
-static void* AllocNear(uintptr_t near, size_t size) {
-    // Same lazy-bind hazard as dladdr: resolve vm_allocate before the first call.
-    typedef kern_return_t (*fn_vm_allocate)(vm_map_t, vm_address_t*, vm_size_t, int);
-    static fn_vm_allocate p_vm_allocate = nullptr;
-    static bool resolved = false;
-    if (!resolved) {
-        resolved = true;
-        p_vm_allocate = (fn_vm_allocate)UFSym("vm_allocate");
-    }
-    if (!p_vm_allocate) {
-        return nullptr;
-    }
-
-    uintptr_t page = 0x4000;
-    uintptr_t base = near & ~(page - 1);
-    for (int64_t off = 0; off < 0x8000000; off += page) {
-        for (int dir = 0; dir < 2; dir++) {
-            uintptr_t addr = dir == 0 ? base + off : base - off;
-            if (addr < 0x100000000ULL) {
-                continue;
-            }
-            vm_address_t a = (vm_address_t)addr;
-            if (p_vm_allocate(mach_task_self(), &a, size, VM_FLAGS_FIXED) == KERN_SUCCESS) {
-                return (void*)a;
-            }
-        }
-    }
-    return nullptr;
-}
-
-static bool PatchBranchFar(uintptr_t site, uintptr_t target) {
-    int64_t delta = (int64_t)target - (int64_t)site;
-    if (delta % 4 == 0 && delta >= -(1LL << 27) && delta < (1LL << 27)) {
-        return PatchBranch(site, target);
-    }
-    uint32_t* tramp = (uint32_t*)AllocNear(site, 0x4000);
-    if (!tramp) {
-        return false;
-    }
-    tramp[0] = 0x58000050;  // ldr x16, #8
-    tramp[1] = 0xD61F0200;  // br x16
-    // arm64e function pointers carry a PAC in the top bits; `br` needs the raw address.
-    *(uint64_t*)&tramp[2] = (uint64_t)target & 0x0000FFFFFFFFFFFFULL;
-    if (!EnsureICacheFlush()) {
-        return false;
-    }
-    FlushICache(tramp, 16);
-    // W^X: write while RW, then flip the page to RX. If the flip fails the page is still
-    // RW (non-executable), so do not point a branch at it.
-    kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)tramp, 0x4000, FALSE,
-                                  VM_PROT_READ | VM_PROT_EXECUTE);
-    if (kr != KERN_SUCCESS) {
-        return false;
-    }
-    return PatchBranch(site, (uintptr_t)tramp);
-}
+// Native code patching is REMOVED: rewriting bytes inside the signed UnityFramework
+// __TEXT crashes on iOS (code signing kills the process right after PatchBranchFar) and
+// breaks clean relaunch. Silent aim / aim-on-fire work purely through the MethodInfo hook
+// on fke, installed in InstallBallisticsHooks. No game code bytes are ever written —
+// external-only.
 
 typedef void (*fn_CamLateUpdate)(void* self, void* mi);
 static fn_CamLateUpdate orig_CamLateUpdate = nullptr;
@@ -10060,8 +9872,12 @@ static void espTick(void) {
             return;
         }
 
-        // The silent-aim code patch is installed lazily: see EnsureSilentAimPatch().
-        EnsureSilentAimPatch();
+        // The silent-aim native code patch is REMOVED: rewriting bytes inside the signed
+        // UnityFramework __TEXT crashes on iOS (code signing kills the process right after
+        // PatchBranchFar, and it also breaks clean relaunch). Silent aim / aim-on-fire keep
+        // working purely through the MethodInfo hook on fke, installed in InstallBallisticsHooks.
+        // No game code bytes are ever written — external-only.
+        // EnsureSilentAimPatch();  // REMOVED — see above
 
         if (tMs - gLastNight > 500) {
             gLastNight = tMs;
@@ -11835,7 +11651,6 @@ static bool hook_TryUse(void* self, void* info, void* mi) {
 
 typedef void (*fn_FireBulletCommand)(void*, Vec3, Vec3, void*, bool, void*);
 static fn_FireBulletCommand orig_FireBulletCommand = nullptr;
-static std::atomic<bool> gFkePatched{false};
 
 typedef void* (*fn_CalcShotHits)(void*, Vec3, Vec3, void*);
 static fn_CalcShotHits p_CalcShotHits = nullptr;
@@ -11918,54 +11733,6 @@ static void hook_FireBulletCommand(void* self, Vec3 from, Vec3 to, void* hits, b
 }
 
 // The native branch is only rewritten once an aim mode that forges the shot is enabled.
-// Patching it at bootstrap (as the old code did) meant every launch modified live game
-// code even though nothing was on, and that code ran during match entry.
-static void EnsureSilentAimPatch(void) {
-    if (gFkePatched.load()) {
-        return;
-    }
-    if (!(gSilentAimEnabled.load() || gAimOnFireEnabled.load() || gHotAimOnFireEnabled.load())) {
-        return;
-    }
-
-    // One attempt per second at most: a mismatch must not burn CPU on every tick.
-    static uint64_t lastTry = 0;
-    const uint64_t now = NowMs();
-    if (lastTry != 0 && now - lastTry < 1000) {
-        return;
-    }
-    lastTry = now;
-
-    uintptr_t ufBase = UnityFrameworkBase();
-    if (!ufBase) {
-        LOG(@"[BALL] UnityFramework base not found");
-        return;
-    }
-
-    uintptr_t fkeAddr = ufBase + 0x19D8624;
-    uintptr_t callSite = ufBase + 0x19D710C;
-    // Only trust the hardcoded RVAs when the call site still branches to the expected fke
-    // address. A game update shifts these, and patching a random instruction (or calling a
-    // wrong orig pointer) aborts the process.
-    if (!BranchTargets(callSite, fkeAddr)) {
-        LOG(@"[BALL] fke call-site mismatch, native patch skipped base=%p", (void*)ufBase);
-        return;
-    }
-
-    if (!PatchBranchFar(callSite, (uintptr_t)hook_FireBulletCommand)) {
-        LOG(@"[BALL] fke call-site patch failed base=%p", (void*)ufBase);
-        return;
-    }
-
-    // The MethodInfo hook may already have captured the original pointer; only fill it in
-    // when that hook was not installed.
-    if (!orig_FireBulletCommand) {
-        orig_FireBulletCommand = (fn_FireBulletCommand)fkeAddr;
-    }
-    gFkePatched = true;
-    LOG(@"[BALL] fke call-site patched base=%p", (void*)ufBase);
-}
-
 typedef Vec2 (*fn_GetInsideUnitCircle)(void*);
 static fn_GetInsideUnitCircle orig_GetInsideUnitCircle = nullptr;
 
@@ -12029,11 +11796,8 @@ static void InstallBallisticsHooks(void) {
                 LOG(@"[BALL] fke not found, silent aim disabled");
             }
 
-            // fkb tail-calls fke with a plain `b`, so the MethodInfo patch above never sees
-            // the real shot. That branch is patched lazily by EnsureSilentAimPatch(), only
-            // after the user actually enables silent aim / aim-on-fire. Until then the
-            // game's code stays byte-for-byte untouched, which is what keeps match entry
-            // stable with every feature off.
+            // Silent aim works purely through the MethodInfo hook above — no native
+            // code bytes are ever modified.
             
             // Local raycast used to rebuild the hit list for the silent-aim direction.
             void* miCalc = p_class_get_method_from_name(rangeCls, "fka", 2);
@@ -14201,7 +13965,7 @@ static void HudTick(void) {
                 gSilentAimEnabled.load() ? @"ON" : @"OFF",
                 g_haveTarget.load() ? 1 : 0,
                 IsFireHeld() ? 1 : 0,
-                gFkePatched.load() ? @"OK" : @"NO"),
+                orig_FireBulletCommand ? @"OK" : @"NO"),
         SafeFmt(@"ESP: %@", (gEspEnabled || gHotEspEnabled) ? @"ON" : @"OFF"),
         SafeFmt(@"TRIGGER: %@", gTriggerbotEnabled.load() ? @"ON" : @"OFF")
     ];
